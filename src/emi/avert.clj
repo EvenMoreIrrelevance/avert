@@ -43,7 +43,10 @@
   [err-or-map message]
   (throw
     (if (map? err-or-map)
-      (ex-info (or (::message err-or-map) message) (dissoc err-or-map ::message))
+      (ex-info
+        (or (::message err-or-map) message)
+        (dissoc err-or-map ::message ::cause)
+        (::cause err-or-map))
       err-or-map)))
 
 (defmacro mavert
@@ -75,8 +78,8 @@
   [err enrichment-map]
   (ex-info
     (or (::message enrichment-map) (ex-message err))
-    (merge (ex-data err) (dissoc enrichment-map ::message))
-    err))
+    (merge (ex-data err) (dissoc enrichment-map ::message ::cause))
+    (or (::cause enrichment-map) err)))
 
 (defmacro with-cleanup
   "try-finally with the finally clause at the top."
@@ -85,27 +88,29 @@
   `(try (do ~@body)
      (finally ~cleanup)))
 
-(defn -coerce-catching-clauses 
+(defn -coerce-catching-clauses
   {:clj-kondo/macroexpand-hook true}
   [clauses]
-  (if-not (simple-symbol? (first clauses))
-    clauses
-    `[(java.lang.Exception ~@clauses)]))
+  (cond
+    (seq? clauses) `[~clauses]
+    (simple-symbol? (first clauses)) `[(java.lang.Exception ~@clauses)]
+    :else clauses))
 
 (defmacro catching
-  "try-catch with the catch body at the top, expressed either as a vector of `catch` clauses
-   or as a simple symbol followed by a body (which will catch and bind `Exception`)."
+  "try-catch with the catch bodies at the top, expressed either as a vector of a simple-symbol
+   and a body (which will catch `Exception`), a single `catch` clause without the `catch` marker,
+   or a vector thereof."
   {:clj-kondo/macroexpand-hook true}
   [catches & body]
   body
-  ($avert
-    (not (vector? catches)) {::message "catches must be a vector of catch clauses"}
-    `(try (do ~@body)
-       ~@(doall
-           (for [clause (-coerce-catching-clauses catches)]
-             ($avert
-               (not (seq? clause)) {::message "multiple catch clauses must be sequences"}
-               `(catch ~@clause)))))))
+  `(try (do ~@body)
+     ~@(doall
+         (let [coerced-catches (-coerce-catching-clauses catches)]
+           ($avert
+             (not (vector? coerced-catches)) {::message "failed coercing catches" :value catches}
+             (seq (remove seq? coerced-catches)) {::message "found non-sequence catch clauses" :value $}
+             (for [clause coerced-catches]
+               (do (-swallow clause) `(catch ~@clause))))))))
 
 (defn -coerce-rethrowing-clauses
   {:clj-kondo/macroexpand-hook true}
@@ -121,11 +126,25 @@
   [rethrows & body]
   `(try (do ~@body)
      ~@(doall
-         (for [clause (-coerce-rethrowing-clauses rethrows)]
+         (let [coerced-rethrows (-coerce-rethrowing-clauses rethrows)]
            ($avert
-             (not (seq? clause)) {::message "multiple catch clauses must be sequences"}
-             (let [[ety evar & bod] clause]
-               (-when-kondo (-swallow ety evar bod))
-               `(catch ~ety ~evar
-                  ~@(butlast bod)
-                  (throw-errform ~(last bod) ""))))))))
+             (not (vector? coerced-rethrows)) {::message "failed coercing rethrows" :value rethrows}
+             (seq (remove seq? coerced-rethrows)) {::message "found non-sequence rethrow clauses" :value $}
+             (for [clause coerced-rethrows]
+               (let [[ety evar & bod] clause]
+                 (-when-kondo (-swallow ety evar bod))
+                 `(catch ~ety ~evar
+                    ~@(butlast bod)
+                    (throw-errform ~(last bod) "")))))))))
+
+(comment 
+  (catching (Throwable _ nil)
+    (assert (= true false))) 
+  
+  (catching [(clojure.lang.ExceptionInfo e {:cause (ex-cause e)})
+             (Exception _ "should be dead code")]
+    (rethrowing (Throwable e {::message "didn't catch Error" ::cause e})
+      (catching [_ nil]
+        (assert (= true false)))))
+
+  *e)
